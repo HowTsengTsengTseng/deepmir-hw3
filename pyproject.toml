@@ -7,13 +7,27 @@ dependencies = [
     "accelerate==1.15.0",
     "diffusers==0.41.0",
     "gdown>=6.5.1",
+    "huggingface-hub",
+    "numpy>=1.21",
+    "pandas",
     "python-dotenv>=1.2.4",
+    "scipy>=1.7",
     "sentencepiece==0.2.2",
     "soundfile==0.14.0",
     "torch==2.11.0",
     "torchaudio==2.11.0",
     "torchsde==0.2.6",
+    "tqdm>=4.66.1",
     "transformers==5.20.1",
+]
+
+[project.optional-dependencies]
+eval = [
+    "librosa",
+    "torchlibrosa",
+    "resampy",
+    "laion-clap @ git+https://github.com/hkchengrex/CLAP.git",
+    "passt @ git+https://github.com/hkchengrex/passt_hear21.git",
 ]
 
 [tool.uv]
