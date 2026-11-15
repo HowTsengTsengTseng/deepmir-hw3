@@ -51,14 +51,16 @@ def cfg_rescaled(
 
 
 class APGState:
-    """Running momentum buffer for Adaptive Projected Guidance (Sadat et al., ICLR 2025)."""
+    """Running momentum buffer and per-step norm tracker for Adaptive Projected Guidance (Sadat et al., ICLR 2025)."""
 
     def __init__(self, momentum: float = -0.5):
         self.momentum = momentum
         self.running_avg: Optional[torch.Tensor] = None
+        self.step_records: list[dict[str, float]] = []
 
     def reset(self) -> None:
         self.running_avg = None
+        self.step_records = []
 
     def update(self, diff: torch.Tensor) -> torch.Tensor:
         if self.momentum == 0.0:
@@ -86,20 +88,38 @@ def cfg_apg(
         pred  = c + (w - 1) * (eta * delta_parallel + delta_orth)
     Note: when eta=1, norm_threshold=0, and momentum=0, this reduces identically to standard CFG.
     """
-    diff = noise_pred_cond - noise_pred_uncond
+    dims = list(range(1, noise_pred_cond.ndim))
+    raw_diff = noise_pred_cond - noise_pred_uncond
+    raw_diff_norm = raw_diff.norm(p=2, dim=dims, keepdim=True)
+
+    diff = raw_diff
     if state is not None:
         diff = state.update(diff)
 
-    dims = list(range(1, diff.ndim))
+    unclipped_norm = diff.norm(p=2, dim=dims, keepdim=True).clamp(min=eps)
     if norm_threshold > 0.0:
-        diff_norm = diff.norm(p=2, dim=dims, keepdim=True).clamp(min=eps)
-        scale = torch.minimum(torch.ones_like(diff_norm), torch.full_like(diff_norm, norm_threshold) / diff_norm)
+        scale = torch.minimum(torch.ones_like(unclipped_norm), torch.full_like(unclipped_norm, norm_threshold) / unclipped_norm)
         diff = diff * scale
+    clipped_norm = diff.norm(p=2, dim=dims, keepdim=True)
 
-    cond_unit = noise_pred_cond / noise_pred_cond.norm(p=2, dim=dims, keepdim=True).clamp(min=eps)
+    cond_norm = noise_pred_cond.norm(p=2, dim=dims, keepdim=True).clamp(min=eps)
+    cond_unit = noise_pred_cond / cond_norm
     parallel = (diff * cond_unit).sum(dim=dims, keepdim=True) * cond_unit
     orthogonal = diff - parallel
     update = eta * parallel + orthogonal
+
+    if state is not None:
+        state.step_records.append(
+            {
+                "raw_diff_norm": float(raw_diff_norm.mean().item()),
+                "unclipped_norm": float(unclipped_norm.mean().item()),
+                "clipped_norm": float(clipped_norm.mean().item()),
+                "parallel_norm": float(parallel.norm(p=2, dim=dims).mean().item()),
+                "orthogonal_norm": float(orthogonal.norm(p=2, dim=dims).mean().item()),
+                "cond_norm": float(cond_norm.mean().item()),
+            }
+        )
+
     return noise_pred_cond + (guidance_scale - 1.0) * update
 
 

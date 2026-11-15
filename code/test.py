@@ -265,6 +265,12 @@ class TestCFGAblations(unittest.TestCase):
                 self.assertTrue((out_dir / "0.mp3").exists())
                 self.assertTrue((out_dir / "1.mp3").exists())
                 self.assertTrue((out_dir / "config.json").exists())
+                self.assertTrue((out_dir / "norm_stats.json").exists())
+                norm_data = json.loads((out_dir / "norm_stats.json").read_text())
+                self.assertEqual(norm_data["num_prompts_logged"], 2)
+                self.assertEqual(norm_data["num_steps_per_prompt"], 3)
+                self.assertIn("unclipped_norm_summary", norm_data)
+                self.assertIn("clip_rate_at_thresholds", norm_data)
 
         args = build_gen_parser().parse_args(
             ["--csv", "test.csv", "--scales", "1.0", "3.0", "7.0", "--cfg_mode", "apg", "--cfg_schedule", "cosine"]

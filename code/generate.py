@@ -46,7 +46,9 @@ def generate(
     apg_norm_threshold: float = 0.0,
     interval_min: float = 0.2,
     interval_max: float = 0.8,
-) -> torch.Tensor:
+    step_records_out: Optional[list[dict[str, float]]] = None,
+    decode_audio: bool = True,
+) -> Optional[torch.Tensor]:
     device = pipe._execution_device
     sampling_rate = pipe.vae.config.sampling_rate
 
@@ -121,6 +123,12 @@ def generate(
             )
         latents = pipe.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
 
+    if step_records_out is not None and apg_state is not None:
+        step_records_out.extend(apg_state.step_records)
+
+    if not decode_audio:
+        return None
+
     # 4. Decode
     audio = pipe.vae.decode(latents).sample
     return audio[0, :, : int(audio_end_in_s * sampling_rate)]
@@ -181,6 +189,88 @@ def format_ablation_name(
     return tag
 
 
+def summarize_apg_norms(all_prompt_records: dict[str, list[dict[str, float]]]) -> dict:
+    """Aggregate per-step APG vector norms across prompts and denoising steps."""
+    if not all_prompt_records:
+        return {}
+    keys = ("raw_diff_norm", "unclipped_norm", "clipped_norm", "parallel_norm", "orthogonal_norm", "cond_norm")
+    flat: dict[str, np.ndarray] = {}
+    for k in keys:
+        vals = [rec[k] for records in all_prompt_records.values() for rec in records if k in rec]
+        flat[k] = np.asarray(vals, dtype=np.float64)
+
+    u = flat["unclipped_norm"]
+    if u.size == 0:
+        return {}
+
+    def _quantiles(arr: np.ndarray) -> dict[str, float]:
+        return {
+            "min": float(np.min(arr)),
+            "p10": float(np.percentile(arr, 10)),
+            "p25": float(np.percentile(arr, 25)),
+            "median": float(np.percentile(arr, 50)),
+            "mean": float(np.mean(arr)),
+            "std": float(np.std(arr)),
+            "p75": float(np.percentile(arr, 75)),
+            "p90": float(np.percentile(arr, 90)),
+            "p95": float(np.percentile(arr, 95)),
+            "p99": float(np.percentile(arr, 99)),
+            "max": float(np.max(arr)),
+        }
+
+    num_steps = max(len(r) for r in all_prompt_records.values())
+    per_step_unclipped = np.array(
+        [[r[s]["unclipped_norm"] for r in all_prompt_records.values() if len(r) > s] for s in range(num_steps)],
+        dtype=np.float64,
+    )
+    per_step_raw = np.array(
+        [[r[s]["raw_diff_norm"] for r in all_prompt_records.values() if len(r) > s] for s in range(num_steps)],
+        dtype=np.float64,
+    )
+    per_step_par = np.array(
+        [[r[s]["parallel_norm"] for r in all_prompt_records.values() if len(r) > s] for s in range(num_steps)],
+        dtype=np.float64,
+    )
+    per_step_orth = np.array(
+        [[r[s]["orthogonal_norm"] for r in all_prompt_records.values() if len(r) > s] for s in range(num_steps)],
+        dtype=np.float64,
+    )
+    per_step_cond = np.array(
+        [[r[s]["cond_norm"] for r in all_prompt_records.values() if len(r) > s] for s in range(num_steps)],
+        dtype=np.float64,
+    )
+
+    return {
+        "num_prompts_logged": len(all_prompt_records),
+        "num_steps_per_prompt": num_steps,
+        "total_step_evaluations": int(u.size),
+        "unclipped_norm_summary": _quantiles(u),
+        "raw_diff_norm_summary": _quantiles(flat["raw_diff_norm"]),
+        "clipped_norm_summary": _quantiles(flat["clipped_norm"]),
+        "parallel_norm_summary": _quantiles(flat["parallel_norm"]),
+        "orthogonal_norm_summary": _quantiles(flat["orthogonal_norm"]),
+        "cond_norm_summary": _quantiles(flat["cond_norm"]),
+        "clip_rate_at_thresholds": {
+            "r=1.0": float(np.mean(u > 1.0)),
+            "r=2.5": float(np.mean(u > 2.5)),
+            "r=5.0": float(np.mean(u > 5.0)),
+            "r=7.5": float(np.mean(u > 7.5)),
+            "r=10.0": float(np.mean(u > 10.0)),
+            "r=15.0": float(np.mean(u > 15.0)),
+            "r=20.0": float(np.mean(u > 20.0)),
+        },
+        "per_step_trajectory": {
+            "unclipped_norm_mean": [round(float(x), 4) for x in per_step_unclipped.mean(axis=1)],
+            "unclipped_norm_max": [round(float(x), 4) for x in per_step_unclipped.max(axis=1)],
+            "unclipped_norm_min": [round(float(x), 4) for x in per_step_unclipped.min(axis=1)],
+            "raw_diff_norm_mean": [round(float(x), 4) for x in per_step_raw.mean(axis=1)],
+            "parallel_norm_mean": [round(float(x), 4) for x in per_step_par.mean(axis=1)],
+            "orthogonal_norm_mean": [round(float(x), 4) for x in per_step_orth.mean(axis=1)],
+            "cond_norm_mean": [round(float(x), 4) for x in per_step_cond.mean(axis=1)],
+        },
+    }
+
+
 def generate_dataset(
     pipe,
     captions: dict[str, str],
@@ -200,6 +290,7 @@ def generate_dataset(
     apg_norm_threshold: float = 0.0,
     interval_min: float = 0.2,
     interval_max: float = 0.8,
+    log_norms: bool = False,
 ) -> Path:
     """Generate one audio file `<id>.mp3` per row in `captions` into `out_dir`."""
     out_dir = Path(out_dir)
@@ -225,10 +316,13 @@ def generate_dataset(
     with open(out_dir / "config.json", "w") as f:
         json.dump(meta, f, indent=2)
 
+    all_prompt_norms: dict[str, list[dict[str, float]]] = {}
     for qid, prompt in tqdm(captions.items(), desc=f"gen ({out_dir.name})"):
         out_path = out_dir / f"{qid}.mp3"
-        if out_path.exists() and not overwrite:
+        need_audio = (not out_path.exists()) or overwrite
+        if not need_audio and not log_norms:
             continue
+        prompt_records: list[dict[str, float]] = []
         audio = generate(
             pipe,
             prompt,
@@ -245,8 +339,28 @@ def generate_dataset(
             apg_norm_threshold=apg_norm_threshold,
             interval_min=interval_min,
             interval_max=interval_max,
+            step_records_out=prompt_records if cfg_mode == "apg" else None,
+            decode_audio=need_audio,
         )
-        save_audio(out_path, audio, sampling_rate)
+        if prompt_records:
+            all_prompt_norms[qid] = prompt_records
+        if need_audio and audio is not None:
+            save_audio(out_path, audio, sampling_rate)
+
+    if all_prompt_norms:
+        norm_stats = summarize_apg_norms(all_prompt_norms)
+        norm_path = out_dir / "norm_stats.json"
+        with open(norm_path, "w") as f:
+            json.dump(norm_stats, f, indent=2)
+        u_sum = norm_stats["unclipped_norm_summary"]
+        rates = norm_stats["clip_rate_at_thresholds"]
+        print(
+            f"[APG Norm Stats -> {norm_path}] "
+            f"unclipped ||d_t||_2: min={u_sum['min']:.3f}, p25={u_sum['p25']:.3f}, "
+            f"median={u_sum['median']:.3f}, mean={u_sum['mean']:.3f}±{u_sum['std']:.3f}, "
+            f"p75={u_sum['p75']:.3f}, p95={u_sum['p95']:.3f}, max={u_sum['max']:.3f} | "
+            f"clip_rate(r=2.5)={rates['r=2.5']*100:.1f}%, clip_rate(r=5.0)={rates['r=5.0']*100:.1f}%"
+        )
     return out_dir
 
 
@@ -271,6 +385,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", default="out.mp3", help="Output file for single-prompt mode")
     parser.add_argument("--out_dir", type=Path, default=Path("outputs/gen"), help="Output directory for --csv mode")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--log_norms",
+        action="store_true",
+        help="Track per-step APG vector norms into norm_stats.json even if audio files already exist in --out_dir",
+    )
     parser.add_argument("--limit", type=int, default=None, help="Generate only first N rows of --csv")
     parser.add_argument("--check", action="store_true", help="compare with StableAudioPipeline")
     return parser
@@ -321,6 +440,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
                 apg_norm_threshold=args.apg_norm_threshold,
                 interval_min=args.interval_min,
                 interval_max=args.interval_max,
+                log_norms=args.log_norms,
             )
         return
 
